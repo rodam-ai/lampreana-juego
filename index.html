@@ -322,6 +322,110 @@ function footprintShape(outer,holes=[]){
  result.holes=holes.map(r=>new THREE.Path(r.map(p=>new THREE.Vector2(p[0],-p[1]))));
  return result;
 }
+// Road footprints keep source segments. Their faces are split along terrain
+// cell edges AND diagonals, so interpolating the road cannot bury a crest.
+const ROAD_CLEARANCE=.06,SHOULDER_CLEARANCE=.035;
+const ROAD_JOIN_OVERLAP=.002; // 2 mm stops Float32 cracks at source nodes.
+const ROAD_SURFACES=new Map();
+function roadFootprint(points,width){
+ if(!Number.isFinite(width)||width<=0)throw Error('Anchura de carretera inválida');
+ const p=[];
+ for(const q of points){
+  if(!Array.isArray(q)||q.length!==2||!q.every(Number.isFinite))throw Error('Coordenada de carretera no finita');
+  if(!p.length||Math.hypot(q[0]-p[p.length-1][0],q[1]-p[p.length-1][1])>1e-8)p.push(q);
+ }
+ if(p.length<2)throw Error('Carretera sin dos puntos distintos');
+ const triangles=[];let acc=0,previous=null;
+ const vertex=(q,n,side,v)=>({x:q[0]+n[0]*width/2*side,z:q[1]+n[1]*width/2*side,u:(side+1)/2,v});
+ for(let i=1;i<p.length;i++){
+  const a=p[i-1],b=p[i],len=Math.hypot(b[0]-a[0],b[1]-a[1]),n=[-(b[1]-a[1])/len,(b[0]-a[0])/len];
+  const pad=ROAD_JOIN_OVERLAP,tx=(b[0]-a[0])/len,tz=(b[1]-a[1])/len;
+  const start=[a[0]-tx*pad,a[1]-tz*pad],end=[b[0]+tx*pad,b[1]+tz*pad];
+  const l=vertex(start,n,-1,acc-pad),r=vertex(start,n,1,acc-pad),ll=vertex(end,n,-1,acc+len+pad),rr=vertex(end,n,1,acc+len+pad);
+  triangles.push([l,r,ll],[r,rr,ll]);
+  if(previous){
+   const centre={x:a[0],z:a[1],u:.5,v:acc};
+   triangles.push([centre,previous[0],l],[centre,r,previous[1]]);
+  }
+  previous=[ll,rr];acc+=len;
+ }
+ return triangles;
+}
+function clipRoadPolygon(polygon,distance){
+ const out=[];
+ for(let i=0;i<polygon.length;i++){
+  const a=polygon[i],b=polygon[(i+1)%polygon.length],da=distance(a),db=distance(b);
+  if(da>=0)out.push(a);
+  if((da>=0)!==(db>=0)){
+   const t=da/(da-db),p={};for(const k of ['x','z','u','v'])p[k]=a[k]+(b[k]-a[k])*t;out.push(p);
+  }
+ }
+ return out;
+}
+function conformRoadTriangles(triangles,grid,offset){
+ const {x0,z0,x1,z1,dx,dz,height}=grid;
+ if(![x0,z0,x1,z1,dx,dz,offset].every(Number.isFinite)||dx<=0||dz<=0||x1<=x0||z1<=z0)throw Error('Rejilla de carretera inválida');
+ const out=[],nx=Math.ceil((x1-x0)/dx),nz=Math.ceil((z1-z0)/dz);
+ for(const triangle of triangles){
+  const j0=Math.max(0,Math.floor((Math.min(...triangle.map(p=>p.z))-z0)/dz));
+  const j1=Math.min(nz-1,Math.floor((Math.max(...triangle.map(p=>p.z))-z0)/dz));
+  for(let j=j0;j<=j1;j++){
+   const bottom=z0+j*dz,top=Math.min(z1,bottom+dz);
+   let row=clipRoadPolygon(triangle,p=>p.z-bottom);row=clipRoadPolygon(row,p=>top-p.z);
+   if(row.length<3)continue;
+   const i0=Math.max(0,Math.floor((Math.min(...row.map(p=>p.x))-x0)/dx));
+   const i1=Math.min(nx-1,Math.floor((Math.max(...row.map(p=>p.x))-x0)/dx));
+   for(let i=i0;i<=i1;i++){
+    const left=x0+i*dx,right=Math.min(x1,left+dx);
+    let cell=clipRoadPolygon(row,p=>p.x-left);cell=clipRoadPolygon(cell,p=>right-p.x);
+    for(const side of [-1,1]){
+     const face=clipRoadPolygon(cell,p=>side*((p.x-left)/dx+(p.z-bottom)/dz-1));
+     for(let k=1;k<face.length-1;k++){
+      const t=[face[0],face[k],face[k+1]],a=t[0],b=t[1],c=t[2];
+      const area=(b.x-a.x)*(c.z-a.z)-(b.z-a.z)*(c.x-a.x);
+      if(Math.abs(area)<1e-9)continue;
+      if(area>0)t.reverse();
+      out.push(t.map(p=>{
+       const y=height(p.x,p.z)+offset;if(!Number.isFinite(y))throw Error('Altura de carretera no finita');
+       return {...p,y};
+      }));
+     }
+    }
+   }
+  }
+ }
+ return out;
+}
+function roadSurfaceMesh(footprint,grid,offset,material,vScale,renderOrder){
+ const triangles=conformRoadTriangles(footprint,grid,offset),pos=[],uv=[];
+ for(const t of triangles)for(const p of t){pos.push(p.x,p.y,p.z);uv.push(p.u,p.v/vScale);}
+ const geometry=new THREE.BufferGeometry();geometry.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));
+ geometry.setAttribute('uv',new THREE.Float32BufferAttribute(uv,2));geometry.computeVertexNormals();
+ const mesh=new THREE.Mesh(geometry,material);mesh.receiveShadow=true;mesh.renderOrder=renderOrder;
+ scene.add(mesh);
+ // Index the Float32 vertices actually rendered, rather than a second height model.
+ const values=geometry.attributes.position.array;
+ for(let k=0;k<values.length;k+=9){
+  const t=[0,3,6].map(i=>({x:values[k+i],y:values[k+i+1],z:values[k+i+2]}));
+  const ix0=Math.floor(Math.min(...t.map(p=>p.x))/20),ix1=Math.floor(Math.max(...t.map(p=>p.x))/20);
+  const iz0=Math.floor(Math.min(...t.map(p=>p.z))/20),iz1=Math.floor(Math.max(...t.map(p=>p.z))/20);
+  for(let j=iz0;j<=iz1;j++)for(let i=ix0;i<=ix1;i++){
+   const key=i+','+j;let bucket=ROAD_SURFACES.get(key);if(!bucket)ROAD_SURFACES.set(key,bucket=[]);bucket.push(t);
+  }
+ }
+ return mesh;
+}
+function drivingHeight(x,z){
+ let best=-Infinity;
+ for(const [a,b,c] of ROAD_SURFACES.get(Math.floor(x/20)+','+Math.floor(z/20))||[]){
+  const det=(b.z-c.z)*(a.x-c.x)+(c.x-b.x)*(a.z-c.z);
+  if(Math.abs(det)<1e-12)continue;
+  const u=((b.z-c.z)*(x-c.x)+(c.x-b.x)*(z-c.z))/det;
+  const v=((c.z-a.z)*(x-c.x)+(a.x-c.x)*(z-c.z))/det,w=1-u-v;
+  if(u>=-1e-7&&v>=-1e-7&&w>=-1e-7)best=Math.max(best,u*a.y+v*b.y+w*c.y);
+ }
+ return Number.isFinite(best)?best:groundH(x,z);
+}
 
 // =====================================================================
 //  MUNDO REAL: Catastro (edificios, parcelas, manzanas), OSM (calles,
@@ -331,10 +435,11 @@ function footprintShape(outer,holes=[]){
 // =====================================================================
 const DATA=JSON.parse(document.getElementById('worlddata').textContent);
 const EXT=DATA.ext,HN=DATA.hn,X0=EXT.x0,Z0=EXT.z0,SIZE=EXT.x1-EXT.x0,DEPTH=EXT.z1-EXT.z0,CELL=SIZE/(HN-1),CELLZ=DEPTH/(HN-1);
+const TERRAIN_STEP=typeof isTouch!=='undefined'&&isTouch&&(HN-1)%2===0?2:1;
 const HGT=(()=>{const b=atob(DATA.H),u=new Uint8Array(b.length);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);const q=new Uint16Array(u.buffer);const h=new Float32Array(q.length);for(let i=0;i<q.length;i++)h[i]=q[i]/100;return h;})();
-function groundH(x,z){let fx=(x-X0)/CELL,fz=(z-Z0)/CELLZ;let i=Math.floor(fx),j=Math.floor(fz);
- if(i<0){i=0;fx=0;}if(j<0){j=0;fz=0;}if(i>=HN-1){i=HN-2;fx=HN-1;}if(j>=HN-1){j=HN-2;fz=HN-1;}fx-=i;fz-=j;
- const h00=HGT[j*HN+i],h10=HGT[j*HN+i+1],h01=HGT[(j+1)*HN+i],h11=HGT[(j+1)*HN+i+1];
+function groundH(x,z){const step=TERRAIN_STEP,n=(HN-1)/step;let fx=(x-X0)/(CELL*step),fz=(z-Z0)/(CELLZ*step);let i=Math.floor(fx),j=Math.floor(fz);
+ if(i<0){i=0;fx=0;}if(j<0){j=0;fz=0;}if(i>=n){i=n-1;fx=n;}if(j>=n){j=n-1;fz=n;}fx-=i;fz-=j;
+ const k=j*step*HN+i*step,h00=HGT[k],h10=HGT[k+step],h01=HGT[k+step*HN],h11=HGT[k+step*HN+step];
  if(fx+fz<=1)return h00+(h10-h00)*fx+(h01-h00)*fz;return h11+(h01-h11)*(1-fx)+(h10-h11)*(1-fz);}
 const ELEV0=DATA.hmin; // altitud real = ELEV0 + y
 // ortofotos PNOA (las incrusta build.py); el mundo se construye cuando están decodificadas
@@ -421,12 +526,22 @@ function fieldColor(h,area){const r=hrand(h,7);// finales de septiembre: rastroj
  return['#8a8d4e','#717441',0];}           // viñedo / verde
 function paintGround(ctx,x0,z0,size,px,detail,height=size){const kx=px/size,kz=px/height,k=Math.min(kx,kz),T=(x,z)=>[(x-x0)*kx,(z-z0)*kz];
  ctx.fillStyle='#b9a277';ctx.fillRect(0,0,px,px);
+ const poly=(item,fill,stroke,lw)=>{const r=item.r||item.outer||item,holes=item.holes||[];ctx.beginPath();for(const ring of [r,...holes]){ring.forEach((p,i)=>{const [a,b]=T(p[0],p[1]);i?ctx.lineTo(a,b):ctx.moveTo(a,b);});ctx.closePath();}if(fill){ctx.fillStyle=fill;ctx.fill('evenodd');}if(stroke){ctx.strokeStyle=stroke;ctx.lineWidth=lw;ctx.stroke();}};
+ const photos=Object.entries(ORTHO_IMG).filter(([key])=>DATA.ortho&&DATA.ortho[key]);
+ const paintPhotos=()=>{
+  for(const [key,img] of photos){const o=DATA.ortho[key],[a,b]=T(o.x0,o.z0);ctx.drawImage(img,a,b,(o.width||o.s)*kx,(o.height||o.s)*kz);}
+  for(const f of DATA.fields)poly(f,null,'rgba(96,88,60,.4)',Math.max(1,k*1.1));
+ };
+ // Opaque PNOA already replaces every synthetic layer in a fully covered
+ // canvas. Don't draw thousands of invisible stripes, especially in towns.
+ if(photos.some(([key])=>{const o=DATA.ortho[key];return o.x0<=x0&&o.z0<=z0&&o.x0+(o.width||o.s)>=x0+size&&o.z0+(o.height||o.s)>=z0+height;})){
+  paintPhotos();return;
+ }
  // fondo: campos genéricos fuera del término (parcelas orientadas)
  ctx.save();for(let s=0;s<2;s++){const ang=s?0.32:-0.21;ctx.setTransform(Math.cos(ang),Math.sin(ang),-Math.sin(ang),Math.cos(ang),px/2,px/2);
   const cw=150*k,ch=95*k;for(let i=-px/cw;i<px/cw;i++)for(let j=-px/ch;j<px/ch;j++){const hh=hashStr(i+':'+j+':'+s+':'+x0);if(s&&hrand(hh,1)<.55)continue;ctx.fillStyle=fieldColor(hh)[0];ctx.fillRect(i*cw,j*ch,cw*(.6+hrand(hh,2)*.6),ch*(.7+hrand(hh,3)*.5));}}
  ctx.restore();
  // parcelas rústicas reales (Catastro)
- const poly=(item,fill,stroke,lw)=>{const r=item.r||item.outer||item,holes=item.holes||[];ctx.beginPath();for(const ring of [r,...holes]){ring.forEach((p,i)=>{const [a,b]=T(p[0],p[1]);i?ctx.lineTo(a,b):ctx.moveTo(a,b);});ctx.closePath();}if(fill){ctx.fillStyle=fill;ctx.fill('evenodd');}if(stroke){ctx.strokeStyle=stroke;ctx.lineWidth=lw;ctx.stroke();}};
  for(const f of DATA.fields){const [c1,c2,pat]=fieldColor(f.h);poly(f,c1);
   if(detail&&pat!==3){ctx.save();poly(f);ctx.clip('evenodd');const b=bboxOf(f.r);let best=0,ang=0;for(let i=0;i<f.r.length;i++){const p=f.r[i],q=f.r[(i+1)%f.r.length],L=Math.hypot(q[0]-p[0],q[1]-p[1]);if(L>best){best=L;ang=Math.atan2(q[1]-p[1],q[0]-p[0]);}}
    const [cx,cz]=T((b[0]+b[2])/2,(b[1]+b[3])/2),R=Math.hypot(b[2]-b[0],b[3]-b[1])*k;ctx.translate(cx,cz);ctx.rotate(ang);ctx.strokeStyle=c2;ctx.globalAlpha=pat===1?.55:.35;ctx.lineWidth=Math.max(.6,k*1.2);
@@ -450,9 +565,8 @@ function paintGround(ctx,x0,z0,size,px,detail,height=size){const kx=px/size,kz=p
  ctx.fillStyle='#5a4a3c';for(const p of PARTS)poly(p,'#5a4a3c');
  if(detail){const id=ctx.getImageData(0,0,px,px),d=id.data;for(let i=0;i<d.length;i+=4){const n=(Math.random()-.5)*16;d[i]+=n;d[i+1]+=n;d[i+2]+=n;}ctx.putImageData(id,0,0);}
  // ortofoto PNOA encima, donde la haya
- let ortho=false;for(const [key,img] of Object.entries(ORTHO_IMG)){const o=DATA.ortho&&DATA.ortho[key];if(!o)continue;const [a,b]=T(o.x0,o.z0);ctx.drawImage(img,a,b,(o.width||o.s)*kx,(o.height||o.s)*kz);ortho=true;}
  // lindes del Catastro encima: la ortofoto del término (2,5 m/px) queda borrosa de cerca
- if(ortho)for(const f of DATA.fields)poly(f,null,'rgba(96,88,60,.4)',Math.max(1,k*1.1));}
+ if(photos.length)paintPhotos();}
 function buildTerrain(){
  const [mc,mg]=cv(isTouch?1536:2048,isTouch?1536:2048);paintGround(mg,X0,Z0,SIZE,mc.width,true,DEPTH);GROUND.macro=mc;
  const [tc,tg]=cv(2048,2048);paintGround(tg,TOWN.x0,TOWN.z0,TOWN.s,2048,true);GROUND.town=tc;
@@ -463,7 +577,7 @@ function buildTerrain(){
   const [canvas,ctx]=cv(2048,2048);paintGround(ctx,o.x0,o.z0,o.width||o.s,2048,true,o.height||o.s);
   GROUND.details.push({key,rect:o,canvas,texture:mkTex(canvas,false)});
  }
- const ST=isTouch?2:1,W=(HN-1)/ST+1,pos=new Float32Array(W*W*3);for(let j=0;j<W;j++)for(let i=0;i<W;i++){const k=j*W+i,src=(j*ST)*HN+i*ST;pos[k*3]=X0+i*ST*CELL;pos[k*3+1]=HGT[src];pos[k*3+2]=Z0+j*ST*CELLZ;}
+ const ST=TERRAIN_STEP,W=(HN-1)/ST+1,pos=new Float32Array(W*W*3);for(let j=0;j<W;j++)for(let i=0;i<W;i++){const k=j*W+i,src=(j*ST)*HN+i*ST;pos[k*3]=X0+i*ST*CELL;pos[k*3+1]=HGT[src];pos[k*3+2]=Z0+j*ST*CELLZ;}
  const idx=new Uint32Array((W-1)*(W-1)*6);let n=0;for(let j=0;j<W-1;j++)for(let i=0;i<W-1;i++){const a=j*W+i,b=a+1,c=a+W,d=c+1;idx[n++]=a;idx[n++]=c;idx[n++]=b;idx[n++]=b;idx[n++]=c;idx[n++]=d;}
  const geo=new THREE.BufferGeometry();geo.setAttribute('position',new THREE.BufferAttribute(pos,3));geo.setIndex(new THREE.BufferAttribute(idx,1));geo.computeVertexNormals();
  const mat=new THREE.MeshStandardMaterial({map:mt,roughness:1});
@@ -510,13 +624,16 @@ function ribbon(pts,w,yOff,mat,vScale,fixedY=null,ro=0){const pos=[],uv=[],idx=[
 function densifyPts(p,step){const o=[p[0]];for(let i=1;i<p.length;i++){const a=p[i-1],b=p[i],n=Math.max(1,Math.ceil(Math.hypot(b[0]-a[0],b[1]-a[1])/step));for(let k=1;k<=n;k++)o.push([lerp(a[0],b[0],k/n),lerp(a[1],b[1],k/n)]);}return o;}
 let TX_town=null;
 function buildRoads(){
+ ROAD_SURFACES.clear();
  {const [c,g]=cv(128,256);g.fillStyle='#4e4e50';g.fillRect(0,0,128,256);dots(g,128,256,4500,['rgba(0,0,0,.25)','rgba(255,255,255,.07)','rgba(120,110,100,.2)'],1,2.5);for(let i=0;i<6;i++){g.fillStyle=`rgba(25,25,25,${R(.1,.25)})`;g.fillRect(R(0,100),R(0,230),R(10,40),R(10,60));}TX_town=mkTex(c);TX_town.wrapS=THREE.ClampToEdgeWrapping;edgeFade(g,128,256,.06);}
  const mk=(map,tr)=>std({map,roughness:.95,transparent:tr,polygonOffset:true,polygonOffsetFactor:-2,polygonOffsetUnits:-2,depthWrite:!tr});
  const mats={main:mk(TX.asphalt,false),town:mk(TX_town,false),gravel:mk(TX.gravel,true),dirt:mk(TX.dirt,true),shoulder:mk(TX.gravel,true)};
- ROADS.forEach((r,i)=>{if(r.s==='path')return;const pts=densifyPts(r.p,5),off=.06+(i%9)*.003;
+ const grid={...EXT,dx:CELL*TERRAIN_STEP,dz:CELLZ*TERRAIN_STEP,height:groundH};
+ ROADS.forEach(r=>{if(r.s==='path')return;
   if(r.s==='asphalt'){const main=['primary','primary_link','secondary','tertiary','tertiary_link','unclassified'].includes(r.t);
-   if(main&&!inUrban(...r.p[Math.floor(r.p.length/2)]))ribbon(pts,r.w+2.6,off-.02,mats.shoulder,10,null,1);ribbon(pts,r.w,off,main?mats.main:mats.town,main?12:9,null,2);}
-  else ribbon(pts,r.w,off,mats[r.s]||mats.dirt,8,null,1);});}
+   if(main&&!inUrban(...r.p[Math.floor(r.p.length/2)]))roadSurfaceMesh(roadFootprint(r.p,r.w+2.6),grid,SHOULDER_CLEARANCE,mats.shoulder,10,1);
+   roadSurfaceMesh(roadFootprint(r.p,r.w),grid,ROAD_CLEARANCE,main?mats.main:mats.town,main?12:9,2);}
+  else roadSurfaceMesh(roadFootprint(r.p,r.w),grid,SHOULDER_CLEARANCE,mats[r.s]||mats.dirt,8,1);});}
 function buildWater(){
  for(const w of WATERS){const sh=footprintShape(w.r,w.holes);const g=new THREE.ShapeGeometry(sh);g.rotateX(-Math.PI/2);
   const m=new THREE.MeshPhongMaterial({color:0x557a86,specular:0xbcc8d0,shininess:90,transparent:true,opacity:.92});waterMats.push(m);
@@ -836,7 +953,7 @@ const SURF={
  gravel:{grip:.5,drag:.05,max:.85,name:'Pista de grava',dust:[.78,.71,.58]},dirt:{grip:.42,drag:.07,max:.8,name:'Camino de tierra',dust:[.68,.57,.44]},
  field:{grip:.34,drag:.25,max:.62,name:'Campo de cereal',dust:[.74,.64,.46]},marsh:{grip:.3,drag:.9,max:.35,name:'Humedal'},water:{grip:.25,drag:2.2,max:.18,name:'Agua'},
 };
-const gh=(x,z)=>groundH(x,z)+surfaceExtra(x,z);
+const gh=(x,z)=>drivingHeight(x,z);
 const _cl=[];
 function collideStatic(v){let impact=0;const S=v.spec;
  for(const off of[S.co,-S.co]){let cx=v.x+Math.sin(v.h)*off,cz=v.z+Math.cos(v.h)*off;const r=S.cr;queryCols(cx,cz,_cl);
